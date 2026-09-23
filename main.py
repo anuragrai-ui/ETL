@@ -105,6 +105,16 @@ JIRA_CONFIG = {
 TICKET_TABLE = 'jira_tickets'
 CHANGELOG_TABLE = 'jira_changelog'
 
+# Ticket "Details" panel fields added after the table was first created.
+# create_tables() appends any of these missing from an existing table.
+DETAILS_PANEL_COLUMNS = [
+    bigquery.SchemaField("request_type", "STRING", description="Service desk Request Type name (customfield_10010)"),
+    bigquery.SchemaField("sentiment", "STRING", description="Sentiment (customfield_10251)"),
+    bigquery.SchemaField("customer_concerns", "STRING", description="Customer Concerns (customfield_13248)"),
+    bigquery.SchemaField("ticket_categorization", "STRING", description="Ticket Categorization parent value (customfield_13247)"),
+    bigquery.SchemaField("ticket_categorization_detail", "STRING", description="Ticket Categorization child value (customfield_13247)"),
+]
+
 class BigQueryJiraETL:
     """BigQuery JIRA ETL Pipeline"""
     
@@ -363,9 +373,15 @@ class BigQueryJiraETL:
         
         # Check if tables already exist, skip creation if they do
         try:
-            self.client.get_table(table_path)
+            ticket_table = self.client.get_table(table_path)
             self.client.get_table(changelog_path)
             logging.info("✅ Tables already exist, skipping creation")
+            existing = {field.name for field in ticket_table.schema}
+            missing = [f for f in DETAILS_PANEL_COLUMNS if f.name not in existing]
+            if missing:
+                ticket_table.schema = list(ticket_table.schema) + missing
+                self.client.update_table(ticket_table, ["schema"])
+                logging.info(f"✅ Added columns to {self.tickets_table}: {[f.name for f in missing]}")
             return True
         except Exception:
             logging.info("🛠️ Tables not found, creating new ones...")
@@ -488,6 +504,7 @@ class BigQueryJiraETL:
             bigquery.SchemaField("creator", "JSON"),
             bigquery.SchemaField("issuetype", "JSON"),
             bigquery.SchemaField("project", "JSON"),
+            *DETAILS_PANEL_COLUMNS,
         ]
         
         # Changelog table schema
@@ -638,7 +655,11 @@ class BigQueryJiraETL:
             "customfield_10999",  # ops team designation (alt/full)
             "customfield_11906",  # Certify Error or Client Error? (multi-checkbox)
             "customfield_10059",  # Time to first response (SLA)
-            "customfield_11080"   # NPI (National Provider Identifier)
+            "customfield_11080",  # NPI (National Provider Identifier)
+            "customfield_10010",  # request_type (service desk Request Type)
+            "customfield_10251",  # sentiment
+            "customfield_13248",  # customer_concerns
+            "customfield_13247",  # ticket_categorization (cascading select)
         ]
         
         start_at = 0
@@ -1638,6 +1659,13 @@ class BigQueryJiraETL:
             ),
             'npi': self.safe_get(fields, 'customfield_11080', None),
             'provider_npi': str(self.safe_get(fields, 'customfield_10716', '') or ''),
+
+            # Details panel fields
+            'request_type': self.safe_get(fields, 'customfield_10010.requestType.name', None),
+            'sentiment': self.safe_get(fields, 'customfield_10251.name', None),
+            'customer_concerns': self.safe_get(fields, 'customfield_13248.value', None),
+            'ticket_categorization': self.safe_get(fields, 'customfield_13247.value', None),
+            'ticket_categorization_detail': self.safe_get(fields, 'customfield_13247.child.value', None),
             
             # Audit fields: keep a single stable value equal to JIRA's updated timestamp
             'last_updated': self.convert_to_timestamp(self.safe_get(fields, 'updated')),
@@ -2735,7 +2763,8 @@ class BigQueryJiraETL:
                 'customfield_10065', 'customfield_11015', 'customfield_10716', 'customfield_11409',
                 'customfield_10461', 'customfield_11833', 'customfield_10617', 'customfield_10029',
                 'customfield_10650', 'customfield_10249', 'customfield_10999', 'customfield_11906',
-                'customfield_10059', 'customfield_11080'
+                'customfield_10059', 'customfield_11080',
+                'customfield_10010', 'customfield_10251', 'customfield_13248', 'customfield_13247'
             ]
             
             batch_tickets = []
@@ -3124,7 +3153,8 @@ def main():
             'customfield_10065', 'customfield_11015', 'customfield_10716', 'customfield_11409',
             'customfield_10461', 'customfield_11833', 'customfield_10617', 'customfield_10029',
             'customfield_10650', 'customfield_10249', 'customfield_10999', 'customfield_11906',
-            'customfield_10059', 'customfield_11080'
+            'customfield_10059', 'customfield_11080',
+                'customfield_10010', 'customfield_10251', 'customfield_13248', 'customfield_13247'
         ]
         
         logging.info(f"🔍 Starting key enumeration from TS-1 to TS-{latest_ticket_num}")
