@@ -12,6 +12,7 @@ import sys
 import time
 import gc
 import traceback
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional, Tuple, Generator
 import requests
@@ -2000,7 +2001,7 @@ class BigQueryJiraETL:
             tickets = deduplicated_tickets_list
             
             # Create a temporary table with the updated data
-            temp_table_id = f"{self.tickets_table}_temp_{int(time.time())}"
+            temp_table_id = f"{self.tickets_table}_temp_{int(time.time())}_{uuid.uuid4().hex[:8]}"
             temp_table_ref = self.dataset_ref.table(temp_table_id)
             
             # Get the schema from the main table
@@ -2278,7 +2279,7 @@ class BigQueryJiraETL:
         temp_table_ref = None
         try:
             # Create temporary table with same schema as target
-            temp_table_id = f"{self.changelog_table}_temp_{int(time.time())}"
+            temp_table_id = f"{self.changelog_table}_temp_{int(time.time())}_{uuid.uuid4().hex[:8]}"
             temp_table_ref = self.dataset_ref.table(temp_table_id)
             main_table_ref = self.dataset_ref.table(self.changelog_table)
             main_table = self.client.get_table(main_table_ref)
