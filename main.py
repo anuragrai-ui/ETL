@@ -74,6 +74,8 @@ except Exception as e:
     create_error_context = create_error_context
     SLACK_NOTIFIER_AVAILABLE = True  # Enable with fallbacks
 
+from etl_monitor import RunMonitor, NullMonitor, run_heartbeat
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -139,6 +141,8 @@ class BigQueryJiraETL:
         
         # Job context for error tracking
         self._job_context: Dict[str, Any] = {}
+        # Replaced by a RunMonitor for the duration of run_etl()
+        self.monitor: RunMonitor = NullMonitor()
     
     def _set_job_context(self, **kwargs: Any) -> None:
         """Set the current job context for error reporting."""
@@ -185,6 +189,11 @@ class BigQueryJiraETL:
         if bigquery_job_id:
             logging.error(f"   BigQuery Job ID: {bigquery_job_id}")
         
+        # During a monitored run, errors go into one end-of-run report instead
+        if not isinstance(self.monitor, NullMonitor):
+            self.monitor.record_error(operation, error, affected_records)
+            send_notification = False
+
         # Send Slack notification if enabled
         if send_notification:
             try:
@@ -609,6 +618,7 @@ class BigQueryJiraETL:
             jql = ' AND '.join(jql_parts) + ' ORDER BY key ASC'
         
         logging.info(f"🔍 JQL Query: {jql}")
+        self.monitor.set_expected_count(self.http, JIRA_CONFIG['base_url'], jql)
         
         # Dynamically get the current highest ticket number
         latest_ticket_info = self._get_latest_ticket_info()
@@ -724,6 +734,11 @@ class BigQueryJiraETL:
                 data = response.json()
                 elapsed = time.perf_counter() - t0
                 
+                if 'issues' not in data:
+                    self.monitor.add_problem(
+                        "critical", "JIRA_RESPONSE_CHANGED",
+                        f"Jira search response has no 'issues' key (keys: {sorted(data.keys())}); "
+                        f"the API response format may have changed.")
                 issues = data.get('issues', [])
                 # High-signal debug for diagnosing "0 issues" runs (safe: no secrets)
                 if start_at == 0:
@@ -750,6 +765,10 @@ class BigQueryJiraETL:
                             "⚠️ Empty first page from JIRA API (startAt=0). Falling back to date-batched fetch. "
                             "This usually indicates an API/pagination quirk rather than truly no matching issues."
                         )
+                        self.monitor.add_problem(
+                            "warning", "PAGINATION_FALLBACK",
+                            "Jira returned an empty first page; fell back to date-batched search, which can "
+                            "miss tickets. The search API may have changed.")
                         yield from self._fetch_remaining_issues_date_batched(
                             fields_param=fields_param,
                             include_changelog=include_changelog,
@@ -781,6 +800,10 @@ class BigQueryJiraETL:
                         # For incremental mode, also log how many issues we've already seen to help with debugging
                         if mode == "incremental":
                             logging.info(f"🔍 Incremental mode: Already processed {len(seen_issue_keys)} unique issues before fallback")
+                        self.monitor.add_problem(
+                            "warning", "PAGINATION_FALLBACK",
+                            "Jira pagination returned repeated pages; fell back to date-batched search, which can "
+                            "miss tickets. The search API may have changed.")
                         yield from self._fetch_remaining_issues_date_batched(fields_param, include_changelog, seen_issue_keys, max_issues, start_date, end_date, mode)
                         return
                 else:
@@ -851,17 +874,23 @@ class BigQueryJiraETL:
                     continue
                 else:
                     logging.error(f"❌ Max retries exceeded for timeout. Stopping.")
+                    self.monitor.record_fetch_error(e, fatal=True, where="jira_stream_timeout")
                     break
             except requests.exceptions.RequestException as e:
                 logging.error(f"❌ Request error in JIRA stream: {e}")
+                self.monitor.record_fetch_error(e, fatal=True, where="jira_stream")
                 break
             except Exception as e:
                 logging.error(f"❌ Unexpected error in JIRA stream: {e}")
+                self.monitor.record_fetch_error(e, fatal=True, where="jira_stream")
                 break
         
         # Safety check for infinite loop prevention
         if page_count >= max_pages:
             logging.warning(f"⚠️ Reached maximum page limit ({max_pages}). This may indicate a pagination issue.")
+            self.monitor.add_problem(
+                "critical", "PAGINATION_LIMIT",
+                f"Stopped after the {max_pages}-page safety limit; remaining tickets were not fetched.")
 
     def fetch_issue_changelog(self, issue_key: str, page_size: int = 100, max_items: int = 1000) -> List[Dict[str, Any]]:
         """Fetch full changelog for a single issue using the dedicated endpoint with pagination.
@@ -982,6 +1011,7 @@ class BigQueryJiraETL:
                 
             except Exception as e:
                 logging.warning(f"⚠️ Error fetching data for week {start_date_str} to {end_date_str}: {e}")
+                self.monitor.record_fetch_error(e, fatal=False, where=f"week {start_date_str}")
             
             # Move to next week
             current_batch_date += timedelta(days=7)
@@ -1010,6 +1040,7 @@ class BigQueryJiraETL:
             logging.info(f"✅ Phase 2 complete: {phase2_count} additional tickets found")
         except Exception as e:
             logging.warning(f"⚠️ Phase 2 key enumeration failed: {e}")
+            self.monitor.record_fetch_error(e, fatal=False, where="key_enumeration")
         
         logging.info(f"🎉 Complete: {total_fetched} total issues fetched across all phases")
     
@@ -1113,6 +1144,7 @@ class BigQueryJiraETL:
                             
                     except Exception as e:
                         logging.warning(f"⚠️ Error processing batch {batch_start} to {batch_end}: {e}")
+                        self.monitor.record_fetch_error(e, fatal=False, where=f"date batch {batch_start}")
                 
                 current_day = next_day
         else:
@@ -2088,6 +2120,7 @@ class BigQueryJiraETL:
             # Update the last_updated timestamp to ensure these records are newer
             for ticket in tickets:
                 ticket['last_updated'] = current_time
+            self.monitor.stats["fallback_inserts"] += len(tickets)
             
             # Insert the updated tickets as new records
             success = self.insert_tickets(tickets)
@@ -2123,6 +2156,9 @@ class BigQueryJiraETL:
                 return False
             
             success = True
+            self.monitor.stats["new"] += len(new_tickets)
+            self.monitor.stats["updated"] += len(updated_tickets)
+            self.monitor.stats["unchanged"] += len(tickets) - len(new_tickets) - len(updated_tickets)
             
             # Insert new tickets
             if new_tickets:
@@ -2901,6 +2937,35 @@ class BigQueryJiraETL:
             end_date: Optional[str] = None, max_issues: Optional[int] = None,
             enable_deduplication: bool = True, include_changelog: bool = True,
             force_update: bool = False) -> bool:
+        """Run the ETL under a RunMonitor that sends one Slack report on problems."""
+        self.monitor = RunMonitor(
+            self.client, self.project_id, self.dataset_id, self.slack_notifier, mode=mode,
+            job_details={"mode": mode, "start_date": start_date, "end_date": end_date,
+                         "max_issues": max_issues, "force_update": force_update or None})
+        self.monitor.limited = bool(max_issues)
+        ok = False
+        try:
+            self.monitor.ensure_run_log_table()
+            self.monitor.check_config()
+            self.monitor.check_staleness()
+            if not self.monitor.check_jira_auth(self.http, JIRA_CONFIG['base_url']):
+                return False
+            ok = self._run_etl(mode, start_date, end_date, max_issues,
+                               enable_deduplication, include_changelog, force_update)
+            return ok
+        except Exception as e:
+            self.monitor.record_error("run_etl", e)
+            raise
+        finally:
+            try:
+                self.monitor.finish(succeeded=ok)
+            finally:
+                self.monitor = NullMonitor()
+
+    def _run_etl(self, mode: str = "full", start_date: Optional[str] = None, 
+            end_date: Optional[str] = None, max_issues: Optional[int] = None,
+            enable_deduplication: bool = True, include_changelog: bool = True,
+            force_update: bool = False) -> bool:
         """Run complete ETL pipeline with memory-efficient streaming and batching."""
         # Set job context for error tracking
         start_time = datetime.now(timezone.utc)
@@ -2946,9 +3011,13 @@ class BigQueryJiraETL:
                     if issue_key:
                         distinct_issue_keys.add(issue_key)
                     
+                    self.monitor.stats["fetched"] += 1
+                    self.monitor.observe_issue(issue)
                     # Transform and add to the current batch
                     ticket = self.build_ticket_row(issue)
                     changelog = self.build_changelog_rows(issue)
+                    self.monitor.stats["rows_built"] += 1
+                    self.monitor.stats["changelog_rows"] += len(changelog)
                     batch_tickets.append(ticket)
                     batch_changelog_entries.extend(changelog)
                     total_processed += 1
@@ -2976,6 +3045,7 @@ class BigQueryJiraETL:
                     # Timebox guard: if approaching deadline, stop fetching more
                     if time.time() > deadline - 60:  # leave ~1 minute for finalization
                         logging.info("⏱️ Approaching execution timebox, stopping early to avoid Cloud Run timeout.")
+                        self.monitor.truncated = True
                         break
 
                 except Exception as e:
@@ -3292,8 +3362,16 @@ def jira_data_loader(request):
       - enable_deduplication: bool (default: true)
       - force_update: bool (default: false) - rewrite existing rows even when
         Jira's `updated` is unchanged (one-time repair of stale columns)
+      - check_heartbeat: bool - only check run/data freshness and alert on
+        staleness; does not run the ETL
     """
     try:
+        if str(_get_param(request, "check_heartbeat", "false")).lower() == "true":
+            etl = BigQueryJiraETL()
+            result = run_heartbeat(etl.client, etl.project_id, etl.dataset_id,
+                                   etl.slack_notifier, etl.tickets_table)
+            return (result, 200)
+
         mode = str((_get_param(request, "mode", "incremental") or "incremental")).lower()
         
         # Auto-calculate start_date for incremental mode if not provided
@@ -3381,6 +3459,13 @@ def jira_data_loader(request):
 
     except Exception as exc:
         logging.exception("Unhandled error in jira_data_loader")
+        try:
+            SlackNotifier().send_error_notification(create_error_context(
+                error=exc,
+                job_details={"trigger": "HTTP", "revision": os.environ.get("K_REVISION", "local")},
+                operation="jira_data_loader (unhandled)"))
+        except Exception as notify_error:
+            logging.error(f"Failed to send Slack notification: {notify_error}")
         return ({"status": "error", "message": str(exc)}, 500)
 
 

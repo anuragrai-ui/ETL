@@ -413,6 +413,58 @@ class SlackNotifier:
         payload = self._format_success_message(job_details, stats, duration_seconds)
         return self._send_webhook(payload)
     
+    def send_run_report(
+        self,
+        status: str,
+        problems_text: str,
+        stats_text: str,
+        job_details: Dict[str, Any],
+        duration_seconds: Optional[float] = None,
+        critical: bool = True
+    ) -> bool:
+        """
+        Send one consolidated report for an ETL run (or heartbeat) that had problems.
+
+        Args:
+            status: 'failed', 'degraded' or 'heartbeat'
+            problems_text: Pre-formatted mrkdwn bullet list of problems
+            stats_text: One-line run statistics
+            job_details: Details about the ETL job (mode, dates, run id, revision)
+            duration_seconds: Optional run duration
+            critical: True if any problem is critical (sent at 'error' level,
+                otherwise at 'warning' level)
+        """
+        if not self._should_notify('error' if critical else 'warning'):
+            logger.info(f"Run report suppressed (level: {self.notification_level})")
+            return False
+
+        titles = {
+            'failed': '🔴 Jira ETL run FAILED',
+            'degraded': '🟠 Jira ETL run completed with problems',
+            'heartbeat': '🔴 Jira ETL heartbeat alert',
+        }
+        details = [f"• {k.replace('_', ' ').title()}: {v}" for k, v in job_details.items()
+                   if v not in (None, '')]
+        if duration_seconds is not None:
+            details.append(f"• Duration: {duration_seconds:.0f}s")
+        project = os.environ.get('GCP_PROJECT_ID', 'certifyos-production-platform')
+        service = os.environ.get('K_SERVICE', 'jiraetlpipeline')
+        logs_url = f"https://console.cloud.google.com/run/detail/us-central1/{service}/logs?project={project}"
+
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": titles.get(status, titles['failed']), "emoji": True}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Problems:*\n{problems_text}"[:2900]}},
+        ]
+        if status != 'heartbeat':
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Run stats:* {stats_text}"}})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Job:*\n" + "\n".join(details)}})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text":
+            f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC · <{logs_url}|Cloud Run logs> · "
+            f"run log: `Reporting.jira_etl_runs`"}]})
+
+        payload = {"attachments": [{"color": "danger" if critical else "warning", "blocks": blocks}]}
+        return self._send_webhook(payload)
+
     def send_warning_notification(
         self,
         warning_message: str,
