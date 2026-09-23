@@ -25,6 +25,8 @@ steps:
       - ${_SERVICE}
       - --image=${_IMAGE}:${COMMIT_SHA}
       - --region=${_REGION}
+      # 'warning' so data-quality alerts (coverage drops, field shape changes) reach Slack
+      - --update-env-vars=SLACK_NOTIFICATION_LEVEL=warning
       - --quiet
 
 images:
