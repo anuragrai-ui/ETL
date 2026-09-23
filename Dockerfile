@@ -7,7 +7,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY main.py slack_notifier.py ./
 
 # Serves jira_data_loader from main.py on $PORT (Cloud Run sets PORT=8080)
 CMD exec functions-framework --target=jira_data_loader --source=main.py --port=${PORT:-8080}

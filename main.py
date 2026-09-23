@@ -1831,8 +1831,12 @@ class BigQueryJiraETL:
             logging.error(f"❌ Error checking existing tickets: {e}")
             return {}
     
-    def filter_duplicates(self, tickets: List[Dict[str, Any]], update_existing: bool = True) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Filter out duplicate tickets and optionally identify tickets to update"""
+    def filter_duplicates(self, tickets: List[Dict[str, Any]], update_existing: bool = True, force_update: bool = False) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Filter out duplicate tickets and optionally identify tickets to update.
+
+        force_update: re-write every existing ticket even if its `updated`
+        timestamp is unchanged (one-time repair of stale columns).
+        """
         if not tickets:
             return [], []
         
@@ -1851,7 +1855,9 @@ class BigQueryJiraETL:
                 continue
                 
             if issue_key in existing_tickets:
-                if update_existing:
+                if force_update:
+                    updated_tickets.append(ticket)
+                elif update_existing:
                     # Check if the ticket has been updated since last load
                     existing_data = existing_tickets[issue_key]
                     ticket_updated = ticket.get('updated')
@@ -2002,25 +2008,23 @@ class BigQueryJiraETL:
                 # Brief pause between chunks to prevent overwhelming BigQuery
                 time.sleep(0.1)
             
-            # Perform MERGE operation
+            # Perform MERGE operation - update every column the ETL populates
+            # (except the key) so fields edited after the first load, e.g.
+            # customers, are refreshed. Columns the rows don't carry are left
+            # untouched rather than overwritten with NULL.
+            row_columns = set().union(*(ticket.keys() for ticket in tickets))
+            set_clause = ",\n                ".join(
+                f"`{field.name}` = source.`{field.name}`"
+                for field in main_table.schema
+                if field.name != "issue_key" and field.name in row_columns
+            )
             merge_query = f"""
             MERGE `{self.project_id}.{self.dataset_id}.{self.tickets_table}` AS target
             USING `{self.project_id}.{self.dataset_id}.{temp_table_id}` AS source
             ON target.issue_key = source.issue_key
             WHEN MATCHED THEN
               UPDATE SET
-                summary = source.summary,
-                description = source.description,
-                status = source.status,
-                status_category = source.status_category,
-                priority = source.priority,
-                updated = source.updated,
-                resolutiondate = source.resolutiondate,
-                resolution = source.resolution,
-                assignee_account_id = source.assignee_account_id,
-                assignee_display_name = source.assignee_display_name,
-                assignee_email_address = source.assignee_email_address,
-                last_updated = source.last_updated
+                {set_clause}
             """
             
             query_job = self.client.query(merge_query)
@@ -2067,7 +2071,7 @@ class BigQueryJiraETL:
             logging.error(f"❌ Error in fallback update strategy: {e}")
             return False
     
-    def insert_tickets(self, tickets: List[Dict[str, Any]], enable_deduplication: bool = False, batch_number: Optional[int] = None) -> bool:
+    def insert_tickets(self, tickets: List[Dict[str, Any]], enable_deduplication: bool = False, batch_number: Optional[int] = None, force_update: bool = False) -> bool:
         """Insert tickets into BigQuery with deduplication support and error notification."""
         if not tickets:
             return True
@@ -2075,7 +2079,7 @@ class BigQueryJiraETL:
         if enable_deduplication:
             # Filter out duplicates and identify tickets to update
             try:
-                new_tickets, updated_tickets = self.filter_duplicates(tickets, update_existing=True)
+                new_tickets, updated_tickets = self.filter_duplicates(tickets, update_existing=True, force_update=force_update)
             except Exception as e:
                 self._handle_error(
                     error=e,
@@ -2842,9 +2846,9 @@ class BigQueryJiraETL:
             logging.error(f"❌ Error creating latest tickets view: {e}")
             return False
     
-    def process_batch(self, tickets: List[Dict], changelogs: List[Dict], enable_deduplication: bool, batch_number: Optional[int] = None) -> bool:
+    def process_batch(self, tickets: List[Dict], changelogs: List[Dict], enable_deduplication: bool, batch_number: Optional[int] = None, force_update: bool = False) -> bool:
         """Helper function to load a single batch of data into BigQuery."""
-        if not self.insert_tickets(tickets, enable_deduplication=enable_deduplication, batch_number=batch_number):
+        if not self.insert_tickets(tickets, enable_deduplication=enable_deduplication, batch_number=batch_number, force_update=force_update):
             logging.error("❌ Failed to process ticket batch.")
             return False
 
@@ -2861,7 +2865,8 @@ class BigQueryJiraETL:
 
     def run_etl(self, mode: str = "full", start_date: Optional[str] = None, 
             end_date: Optional[str] = None, max_issues: Optional[int] = None,
-            enable_deduplication: bool = True, include_changelog: bool = True) -> bool:
+            enable_deduplication: bool = True, include_changelog: bool = True,
+            force_update: bool = False) -> bool:
         """Run complete ETL pipeline with memory-efficient streaming and batching."""
         # Set job context for error tracking
         start_time = datetime.now(timezone.utc)
@@ -2872,6 +2877,7 @@ class BigQueryJiraETL:
             max_issues=max_issues,
             enable_deduplication=enable_deduplication,
             include_changelog=include_changelog,
+            force_update=force_update,
             start_time=start_time.isoformat(),
             project_id=self.project_id,
             dataset_id=self.dataset_id
@@ -2916,7 +2922,7 @@ class BigQueryJiraETL:
                     # When the batch is full, process it
                     if len(batch_tickets) >= batch_size:
                         logging.info(f"📦 Processing batch {batch_num} with {len(batch_tickets)} tickets...")
-                        if not self.process_batch(batch_tickets, batch_changelog_entries, enable_deduplication, batch_num=batch_num):
+                        if not self.process_batch(batch_tickets, batch_changelog_entries, enable_deduplication, batch_number=batch_num, force_update=force_update):
                             # Error already handled in process_batch
                             self._handle_error(
                                 error=Exception(f"Batch {batch_num} processing failed"),
@@ -2951,7 +2957,7 @@ class BigQueryJiraETL:
             # Process the final, partially-filled batch
             if batch_tickets:
                 logging.info(f"📦 Processing final batch {batch_num} with {len(batch_tickets)} tickets...")
-                if not self.process_batch(batch_tickets, batch_changelog_entries, enable_deduplication, batch_num=batch_num):
+                if not self.process_batch(batch_tickets, batch_changelog_entries, enable_deduplication, batch_number=batch_num, force_update=force_update):
                     self._handle_error(
                         error=Exception(f"Final batch {batch_num} processing failed"),
                         operation="process_batch_final",
@@ -3244,11 +3250,13 @@ def jira_data_loader(request):
     """
     HTTP-triggered entry point for Cloud Functions / Cloud Run (Functions Framework).
     Accepts both JSON body and query parameters:
-      - mode: 'full' | 'incremental' | 'backfill' (default: 'full')
+      - mode: 'full' | 'incremental' | 'backfill' (default: 'incremental')
       - start_date: YYYY-MM-DD
       - end_date: YYYY-MM-DD
       - max_issues: int
       - enable_deduplication: bool (default: true)
+      - force_update: bool (default: false) - rewrite existing rows even when
+        Jira's `updated` is unchanged (one-time repair of stale columns)
     """
     try:
         mode = str((_get_param(request, "mode", "incremental") or "incremental")).lower()
@@ -3291,6 +3299,7 @@ def jira_data_loader(request):
         max_issues_raw = _get_param(request, "max_issues")
         enable_deduplication_raw = _get_param(request, "enable_deduplication", "true")
         include_changelog_raw = _get_param(request, "include_changelog", "true")
+        force_update_raw = _get_param(request, "force_update", "false")
 
         max_issues = None
         if max_issues_raw not in (None, "", "null"):
@@ -3301,10 +3310,11 @@ def jira_data_loader(request):
 
         enable_deduplication = str(enable_deduplication_raw).lower() != "false"
         include_changelog = str(include_changelog_raw).lower() != "false"
+        force_update = str(force_update_raw).lower() == "true"
 
         logging.info(
-            "Starting ETL via HTTP: mode=%s, start=%s, end=%s, max_issues=%s, dedupe=%s, include_changelog=%s",
-            mode, start_date, end_date, max_issues, enable_deduplication, include_changelog,
+            "Starting ETL via HTTP: mode=%s, start=%s, end=%s, max_issues=%s, dedupe=%s, include_changelog=%s, force_update=%s",
+            mode, start_date, end_date, max_issues, enable_deduplication, include_changelog, force_update,
         )
 
         etl = BigQueryJiraETL()
@@ -3315,6 +3325,7 @@ def jira_data_loader(request):
             max_issues=max_issues,
             enable_deduplication=enable_deduplication,
             include_changelog=include_changelog,
+            force_update=force_update,
         )
 
         status_code = 200 if ok else 500
@@ -3328,6 +3339,7 @@ def jira_data_loader(request):
                 "max_issues": max_issues,
                 "enable_deduplication": enable_deduplication,
                 "include_changelog": include_changelog,
+                "force_update": force_update,
             },
             status_code,
         )
