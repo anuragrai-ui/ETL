@@ -677,6 +677,8 @@ class BigQueryJiraETL:
         # Since daily loads typically have < 200 tickets, if pagination fails early, switch fast
         consecutive_empty_pages = 0
         max_empty_pages = 1 if mode == "incremental" else 3
+        # /search/jql ignores startAt and pages with nextPageToken/isLast
+        next_page_token = None
         
         while page_count < max_pages:
             try:
@@ -684,9 +686,10 @@ class BigQueryJiraETL:
                 params = {
                     'jql': jql,
                     'fields': ','.join(fields_param),
-                    'startAt': start_at,
                     'maxResults': page_size
                 }
+                if next_page_token:
+                    params['nextPageToken'] = next_page_token
                 
                 # Only expand changelog if explicitly requested
                 if include_changelog:
@@ -783,9 +786,10 @@ class BigQueryJiraETL:
                 # Progress tracking (don't rely on total_available since it's broken)
                 logging.info(f"📊 Progress: Streamed {total_fetched} unique issues (found {len(new_issues)} new in this page)")
                 
-                # If we got fewer issues than requested, we might be at the end
-                if len(issues) < page_size:
-                    logging.info("📋 Received fewer issues than requested - likely at end of results.")
+                # Jira signals the last page with isLast / no nextPageToken
+                next_page_token = data.get('nextPageToken')
+                if data.get('isLast') or not next_page_token:
+                    logging.info("📋 Reached last page of results.")
                     break
                 
                 logging.info(f"📦 Received {len(issues)} issues in this page")
